@@ -56,7 +56,8 @@ case "$cmd" in
             -parallel-testing-enabled NO \
             -only-testing:"$only" \
             -derivedDataPath "$DERIVED" \
-            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= \
+            ENABLE_HARDENED_RUNTIME=NO
         ;;
 
     ui)

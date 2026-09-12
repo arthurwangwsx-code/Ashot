@@ -77,6 +77,8 @@ dist/vVERSION/RELEASE_NOTES.md
 
 `./dev.sh build` 继续使用 Apple Development 签名及本机架构。`./release.sh` 则明确选择分发签名模式并编译 Universal 包。构建失败时不会提前删除上一次成功的应用；日志与其他产物也会保留。
 
+`./dev.sh test` 使用无需个人证书的 ad-hoc 签名，并**只在单元测试构建中**关闭 Hardened Runtime，使测试宿主能够加载测试框架。开发构建和 Release 分发包仍保留各自的安全配置，发布脚本会为分发包显式启用 Hardened Runtime；这不修改 macOS 的 Gatekeeper 设置。
+
 ## 参考
 
 - [GitHub CLI release create](https://cli.github.com/manual/gh_release_create)

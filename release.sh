@@ -100,7 +100,7 @@ if ! $UNNOTARIZED; then
     xcrun stapler validate "$DIST/$NAME.dmg"
 fi
 python3 - "$APP" "$DIST/release.json" "$VERSION" "$TAG" "$COMMIT" "$SIGNING" "$REPO" <<'PY'
-import datetime, json, pathlib, plistlib, sys
+import datetime, json, pathlib, platform, plistlib, re, sys
 app, output, version, tag, commit, signing, repository = sys.argv[1:]
 with open(pathlib.Path(app) / 'Contents/Info.plist', 'rb') as file:
     info = plistlib.load(file)
@@ -108,7 +108,14 @@ data = dict(version=version, tag=tag, commit=commit, repository=repository,
             bundleVersion=info['CFBundleShortVersionString'], buildNumber=info['CFBundleVersion'],
             minimumMacOS=info['LSMinimumSystemVersion'], architectures=['arm64', 'x86_64'],
             signing=signing, notarized=signing == 'developer-id',
+            buildHostMacOS=platform.mac_ver()[0], xcodeBuild=info.get('DTXcodeBuild'), sdk=info.get('DTSDKName'),
             builtAt=datetime.datetime.now(datetime.timezone.utc).isoformat())
+test_log = pathlib.Path('build/logs/xcodebuild.log').read_text(errors='replace')
+test_counts = re.findall(r'Test run with (\d+) tests(?: in (\d+) suites)? passed', test_log)
+if test_counts:
+    data['swiftTestsPassed'] = int(test_counts[-1][0])
+    if test_counts[-1][1]:
+        data['swiftTestSuites'] = int(test_counts[-1][1])
 pathlib.Path(output).write_text(json.dumps(data, indent=2) + '\n')
 PY
 python3 - "$DIST/release.json" "$DIST/RELEASE_NOTES.md" <<'PY'
