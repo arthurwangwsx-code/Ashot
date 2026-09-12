@@ -31,7 +31,7 @@ else
     [[ -n "${ASHOT_NOTARY_PROFILE:-}" ]] || fail 'ASHOT_NOTARY_PROFILE is required for notarization.'
     SIGNING=developer-id
 fi
-for tool in git python3 xcodebuild codesign ditto hdiutil shasum lipo; do
+for tool in git python3 xcodebuild codesign ditto zip unzip hdiutil shasum lipo; do
     command -v "$tool" >/dev/null || fail "Missing tool: $tool"
 done
 [[ "$(uname -s)" == Darwin ]] || fail 'Run packaging on macOS.'
@@ -79,7 +79,7 @@ APP="$STAGE/Ashot.app"
 ditto --noextattr --norsrc "$ROOT/build/Ashot.app" "$APP"
 [[ ! -e "$APP/Contents/embedded.provisionprofile" ]] || fail 'Distribution app contains a provisioning profile.'
 if ! $UNNOTARIZED; then
-    ditto -c -k --keepParent --noextattr --norsrc "$APP" "$STAGE/notarize.zip"
+    bash scripts/package-app.sh "$APP" "$STAGE/notarize.zip"
     xcrun notarytool submit "$STAGE/notarize.zip" --keychain-profile "$ASHOT_NOTARY_PROFILE" --wait --timeout 30m
     xcrun stapler staple "$APP"
     xcrun stapler validate "$APP"
@@ -87,7 +87,9 @@ if ! $UNNOTARIZED; then
 fi
 codesign --verify --deep --strict "$APP"
 NAME="Ashot-$VERSION-universal"
-ditto -c -k --keepParent --noextattr --norsrc "$APP" "$DIST/$NAME.zip"
+bash scripts/package-app.sh "$APP" "$DIST/$NAME.zip"
+unzip -q "$DIST/$NAME.zip" -d "$STAGE/zip-verification"
+codesign --verify --deep --strict "$STAGE/zip-verification/Ashot.app"
 mkdir "$STAGE/dmg"
 ditto --noextattr --norsrc "$APP" "$STAGE/dmg/Ashot.app"
 ln -s /Applications "$STAGE/dmg/Applications"

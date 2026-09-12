@@ -1,10 +1,12 @@
 """Fast, offline safety/argument checks. Real Xcode packaging is verified on the release Mac."""
 import importlib.util
 import os
+import stat
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -50,6 +52,54 @@ class ReleaseGuardTests(unittest.TestCase):
         result = subprocess.run(['bash', str(ROOT / 'build.sh')], env=env,
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 2)
+
+
+class AppArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.app = self.root / 'Example App.app'
+        self.binary = self.app / 'Contents/MacOS/Example'
+        self.binary.parent.mkdir(parents=True)
+        (self.app / 'Contents/Info.plist').write_text('archive fixture')
+        self.binary.write_bytes(b'executable fixture\n')
+        self.binary.chmod(0o755)
+        self.output = self.root / 'Example App.zip'
+
+    def package(self, app=None, output=None):
+        return subprocess.run(['bash', str(ROOT / 'scripts/package-app.sh'),
+                               str(app or self.app), str(output or self.output)],
+                              capture_output=True, text=True, timeout=15)
+
+    def test_archive_preserves_content_executable_mode_and_symlinks(self):
+        (self.binary.parent / 'Alias').symlink_to('Example')
+        result = self.package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with zipfile.ZipFile(self.output) as archive:
+            self.assertIsNone(archive.testzip())
+            prefix = 'Example App.app/Contents/MacOS/'
+            self.assertEqual(archive.read(prefix + 'Example'), self.binary.read_bytes())
+            self.assertTrue(archive.getinfo(prefix + 'Example').external_attr >> 16 & stat.S_IXUSR)
+            self.assertTrue(stat.S_ISLNK(archive.getinfo(prefix + 'Alias').external_attr >> 16))
+            self.assertEqual(archive.read(prefix + 'Alias'), b'Example')
+
+    def test_existing_archive_is_preserved(self):
+        self.output.write_bytes(b'keep existing file')
+        result = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('already exists', result.stderr)
+        self.assertEqual(self.output.read_bytes(), b'keep existing file')
+
+    def test_invalid_bundle_is_rejected(self):
+        result = self.package(app=self.root / 'Missing.app')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+
+    def test_archive_cannot_be_created_inside_its_input(self):
+        result = self.package(output=self.app / 'recursive.zip')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('outside the app bundle', result.stderr)
 
 
 class PublicSourceTests(unittest.TestCase):
