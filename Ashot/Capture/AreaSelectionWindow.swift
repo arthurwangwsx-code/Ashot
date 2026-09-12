@@ -17,7 +17,7 @@ final class AreaSelectionController {
     private var finished = false
     private var didPushCursor = false
 
-    func beginSelection(completion: @escaping (AreaSelectionResult) -> Void) {
+    func beginSelection(requireConfirmation: Bool? = nil, completion: @escaping (AreaSelectionResult) -> Void) {
         guard windows.isEmpty, self.completion == nil else {
             completion(.cancelled)
             return
@@ -25,7 +25,7 @@ final class AreaSelectionController {
         self.completion = completion
 
         for screen in NSScreen.screens {
-            let window = AreaSelectionWindow(screen: screen)
+            let window = AreaSelectionWindow(screen: screen, requireConfirmation: requireConfirmation ?? UserDefaults.standard.bool(forKey: "confirmAreaSelection"))
             window.onComplete = { [weak self] rect, displayID in
                 self?.finish(with: .area(rect: rect, displayID: displayID))
             }
@@ -116,7 +116,7 @@ final class AreaSelectionWindow: NSWindow {
     let targetScreen: NSScreen
     private var selectionView: AreaSelectionView!
 
-    init(screen: NSScreen) {
+    init(screen: NSScreen, requireConfirmation: Bool = false) {
         self.targetScreen = screen
         super.init(
             contentRect: screen.frame,
@@ -134,6 +134,7 @@ final class AreaSelectionWindow: NSWindow {
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         selectionView = AreaSelectionView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        selectionView.requireConfirmation = requireConfirmation
         selectionView.onSelectionComplete = { [weak self] rect in
             self?.handleSelection(rect)
         }
@@ -162,6 +163,7 @@ final class AreaSelectionWindow: NSWindow {
 }
 
 final class AreaSelectionView: NSView {
+    var requireConfirmation = false
     var onSelectionComplete: ((CGRect?) -> Void)?
     var onCancel: (() -> Void)?
     var onCaptureFrontmostWindow: (() -> Void)?
@@ -170,6 +172,8 @@ final class AreaSelectionView: NSView {
     private var currentPoint: NSPoint?
     private var isSelecting = false
     private var magnetizedRect: NSRect?
+    private var movingSelection: (rect: CGRect, origin: CGPoint)?
+    private var resizeOrigin: CGPoint?
 
     private var selectionRect: NSRect? {
         guard let start = startPoint, let current = currentPoint else { return nil }
@@ -185,7 +189,7 @@ final class AreaSelectionView: NSView {
         NSColor.black.withAlphaComponent(0.3).setFill()
         dirtyRect.fill()
 
-        if let rect = selectionRect, isSelecting {
+        if let rect = selectionRect, rect.width > 3, rect.height > 3 {
             NSGraphicsContext.current?.saveGraphicsState()
             NSGraphicsContext.current?.compositingOperation = .clear
             NSBezierPath(rect: rect).fill()
@@ -197,6 +201,13 @@ final class AreaSelectionView: NSView {
         } else if let current = currentPoint {
             drawGlobalCrosshairs(at: current)
             drawMagnifier(at: current)
+        }
+        if requireConfirmation {
+            let text = L10n.string("Drag to select • Drag inside to move • Drag a corner to resize • Return: capture • Space: window • Esc: cancel")
+            let frame = CGRect(x: 20, y: 20, width: max(80, min(bounds.width - 40, 790)), height: 48)
+            NSColor.black.withAlphaComponent(0.8).setFill()
+            NSBezierPath(roundedRect: frame, xRadius: 8, yRadius: 8).fill()
+            (text as NSString).draw(in: frame.insetBy(dx: 12, dy: 8), withAttributes: Self.safeTextAttributes(size: 12, weight: .regular, color: .white))
         }
     }
 
@@ -333,7 +344,7 @@ final class AreaSelectionView: NSView {
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard point.x.isFinite, point.y.isFinite else { return }
-        currentPoint = point
+        if startPoint == nil { currentPoint = point }
         needsDisplay = true
     }
 
@@ -347,6 +358,16 @@ final class AreaSelectionView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard point.x.isFinite, point.y.isFinite else { return }
+        window?.makeFirstResponder(self)
+        if requireConfirmation, let rect = selectionRect, rect.width > 3, rect.height > 3 {
+            if event.clickCount > 1, rect.contains(point) { onSelectionComplete?(rect); return }
+            let corners = [CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY),
+                           CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: rect.maxX, y: rect.maxY)]
+            if let index = corners.firstIndex(where: { hypot($0.x - point.x, $0.y - point.y) < 12 }) {
+                resizeOrigin = corners[3 - index]; startPoint = resizeOrigin; currentPoint = point; isSelecting = true; return
+            }
+            if rect.contains(point) { movingSelection = (rect, point); return }
+        }
         startPoint = point
         currentPoint = startPoint
         isSelecting = true
@@ -356,6 +377,12 @@ final class AreaSelectionView: NSView {
     override func mouseDragged(with event: NSEvent) {
         let dragPoint = convert(event.locationInWindow, from: nil)
         guard dragPoint.x.isFinite, dragPoint.y.isFinite else { return }
+        if let move = movingSelection {
+            let x = min(bounds.maxX - move.rect.width, max(bounds.minX, move.rect.minX + dragPoint.x - move.origin.x))
+            let y = min(bounds.maxY - move.rect.height, max(bounds.minY, move.rect.minY + dragPoint.y - move.origin.y))
+            startPoint = CGPoint(x: x, y: y); currentPoint = CGPoint(x: x + move.rect.width, y: y + move.rect.height)
+            needsDisplay = true; return
+        }
         if !isSelecting {
             startPoint = Self.dragStartPoint(
                 existingStart: startPoint,
@@ -364,7 +391,12 @@ final class AreaSelectionView: NSView {
             )
             isSelecting = true
         }
-        currentPoint = dragPoint
+        let clamped = CGPoint(x: min(bounds.maxX, max(bounds.minX, dragPoint.x)), y: min(bounds.maxY, max(bounds.minY, dragPoint.y)))
+        if let startPoint, event.modifierFlags.contains(.shift) {
+            let dx = clamped.x - startPoint.x, dy = clamped.y - startPoint.y
+            let side = min(abs(dx), abs(dy))
+            currentPoint = CGPoint(x: startPoint.x + (dx < 0 ? -side : side), y: startPoint.y + (dy < 0 ? -side : side))
+        } else { currentPoint = clamped }
         needsDisplay = true
     }
 
@@ -380,13 +412,19 @@ final class AreaSelectionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if movingSelection != nil { movingSelection = nil; needsDisplay = true; return }
         let point = convert(event.locationInWindow, from: nil)
         guard point.x.isFinite, point.y.isFinite else {
             onSelectionComplete?(nil)
             return
         }
-        currentPoint = point
+        if !event.modifierFlags.contains(.shift) {
+            currentPoint = CGPoint(x: min(bounds.maxX, max(bounds.minX, point.x)), y: min(bounds.maxY, max(bounds.minY, point.y)))
+        }
         isSelecting = false
+        resizeOrigin = nil
+
+        if requireConfirmation { needsDisplay = true; return }
 
         if let rect = selectionRect, rect.width > 3, rect.height > 3 {
             onSelectionComplete?(rect)
@@ -400,6 +438,8 @@ final class AreaSelectionView: NSView {
             onCancel?()
         } else if event.keyCode == 49 { // Space
             onCaptureFrontmostWindow?()
+        } else if event.keyCode == 36 || event.keyCode == 76 {
+            if let rect = selectionRect, rect.width > 3, rect.height > 3 { onSelectionComplete?(rect) }
         }
     }
 

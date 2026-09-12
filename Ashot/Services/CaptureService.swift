@@ -4,20 +4,14 @@ import ScreenCaptureKit
 import UniformTypeIdentifiers
 
 struct CaptureCompletionOptions: Equatable {
-    let showPreview: Bool
-    let autoCopy: Bool
-    let autoSave: Bool
-
+    let showPreview: Bool, autoCopy: Bool, autoSave: Bool
     init(showPreview: Bool?, autoCopy: Bool?, autoSave: Bool) {
-        self.showPreview = showPreview ?? true
-        self.autoCopy = autoCopy ?? true
-        self.autoSave = autoSave
+        self.showPreview = showPreview ?? true; self.autoCopy = autoCopy ?? true; self.autoSave = autoSave
     }
 }
 
-enum CaptureMode {
+enum CaptureMode: String, Sendable {
     case area, fullscreen, window, delayed, scrolling
-
     var historySource: String {
         switch self {
         case .area: return "Area"
@@ -29,19 +23,14 @@ enum CaptureMode {
     }
 }
 
-private enum CaptureFailure: LocalizedError {
-    case displayUnavailable
-    case windowUnavailable
-    case invalidCaptureRegion
-
+enum CaptureFailure: LocalizedError {
+    case displayUnavailable, windowUnavailable, invalidCaptureRegion, permissionUnavailable
     var errorDescription: String? {
         switch self {
-        case .displayUnavailable:
-            return "The selected display is no longer available. Try the screenshot again."
-        case .windowUnavailable:
-            return "No capturable window was found. Bring the window you want to capture to the front and try again."
-        case .invalidCaptureRegion:
-            return "The selected capture area is invalid or too large. Try selecting the area again."
+        case .displayUnavailable: return L10n.string("The selected display changed or disconnected. Select the capture area again.")
+        case .windowUnavailable: return L10n.string("The selected window is no longer available. Choose another window.")
+        case .invalidCaptureRegion: return L10n.string("The capture area is invalid or too large. Select a smaller area.")
+        case .permissionUnavailable: return L10n.string("Screen access is unavailable. Check Permissions in Ashot settings.")
         }
     }
 }
@@ -49,66 +38,72 @@ private enum CaptureFailure: LocalizedError {
 enum CaptureGeometry {
     nonisolated static let maximumPixelDimension = 32_768
     nonisolated static let maximumPixelCount = 64_000_000
-
-    /// Sanitizes event-derived rectangles before passing them to ScreenCaptureKit. This prevents
-    /// NaN, infinity, off-display coordinates, and accidental enormous allocations from reaching
-    /// framework code.
-    nonisolated static func validatedSourceRect(
-        _ rect: CGRect,
-        displaySize: CGSize
-    ) -> CGRect? {
-        guard AreaSelectionView.isFinite(rect),
-              displaySize.width.isFinite,
-              displaySize.height.isFinite,
-              displaySize.width > 0,
-              displaySize.height > 0 else { return nil }
-
-        let normalized = rect.standardized
-        let displayBounds = CGRect(origin: .zero, size: displaySize)
-        let clipped = normalized.intersection(displayBounds)
-        guard !clipped.isNull,
-              clipped.width > 3,
-              clipped.height > 3 else { return nil }
+    nonisolated static func validatedSourceRect(_ rect: CGRect, displaySize: CGSize) -> CGRect? {
+        guard AreaSelectionView.isFinite(rect), displaySize.width.isFinite, displaySize.height.isFinite,
+              displaySize.width > 0, displaySize.height > 0 else { return nil }
+        let clipped = rect.standardized.intersection(CGRect(origin: .zero, size: displaySize))
+        guard !clipped.isNull, clipped.width > 3, clipped.height > 3 else { return nil }
         return clipped
     }
-
-    nonisolated static func outputPixelSize(
-        logicalSize: CGSize,
-        scale: Int
-    ) -> (width: Int, height: Int)? {
-        guard logicalSize.width.isFinite,
-              logicalSize.height.isFinite,
-              logicalSize.width > 0,
-              logicalSize.height > 0,
-              scale > 0 else { return nil }
-
-        let width = logicalSize.width * CGFloat(scale)
-        let height = logicalSize.height * CGFloat(scale)
-        guard width <= CGFloat(maximumPixelDimension),
-              height <= CGFloat(maximumPixelDimension),
-              width.rounded() * height.rounded() <= CGFloat(maximumPixelCount),
-              width >= 1,
-              height >= 1 else { return nil }
+    nonisolated static func outputPixelSize(logicalSize: CGSize, scale: Int) -> (width: Int, height: Int)? {
+        guard logicalSize.width.isFinite, logicalSize.height.isFinite,
+              logicalSize.width > 0, logicalSize.height > 0, scale > 0 else { return nil }
+        let width = logicalSize.width * CGFloat(scale), height = logicalSize.height * CGFloat(scale)
+        guard width <= CGFloat(maximumPixelDimension), height <= CGFloat(maximumPixelDimension),
+              width.rounded() * height.rounded() <= CGFloat(maximumPixelCount), width >= 1, height >= 1 else { return nil }
         return (Int(width.rounded()), Int(height.rounded()))
     }
+    nonisolated static func excludesWindow(owner: String?, layer: Int, ownBundle: String?, hideDesktopIcons: Bool) -> Bool {
+        if let ownBundle, owner == ownBundle { return true }
+        // Finder's ordinary windows are layer zero. Only desktop surfaces are filtered; no
+        // defaults writes, Finder relaunches, or global desktop mutations are used.
+        return hideDesktopIcons && owner == "com.apple.finder" && layer < 0
+    }
+}
+
+struct CaptureDisplaySnapshot: Equatable, Sendable {
+    let id: CGDirectDisplayID
+    let frame: CGRect
+    let backingScale: CGFloat
+    let vendor: UInt32, model: UInt32, serial: UInt32
+    init(screen: NSScreen) {
+        id = screen.displayID; frame = screen.frame; backingScale = screen.backingScaleFactor
+        vendor = CGDisplayVendorNumber(id); model = CGDisplayModelNumber(id); serial = CGDisplaySerialNumber(id)
+    }
+    init(id: CGDirectDisplayID, frame: CGRect, backingScale: CGFloat, vendor: UInt32 = 0, model: UInt32 = 0, serial: UInt32 = 0) {
+        self.id = id; self.frame = frame; self.backingScale = backingScale
+        self.vendor = vendor; self.model = model; self.serial = serial
+    }
+    func matchingScreen() -> NSScreen? { NSScreen.screens.first { Self(screen: $0) == self } }
 }
 
 enum ImageSaveError: LocalizedError {
     case encodingFailed
-
-    var errorDescription: String? {
-        "The screenshot could not be encoded in the selected image format."
-    }
+    var errorDescription: String? { L10n.string("The screenshot could not be encoded in the selected image format.") }
 }
 
 final class CaptureService {
     static let shared = CaptureService()
+    private enum Target {
+        case display(CaptureDisplaySnapshot, CGRect?, CaptureMode)
+        case window(CGWindowID, pid_t)
+    }
+    private var lastCapture: (target: Target, sensitive: Bool)?
+    private var session = UUID()
+    private var task: Task<Void, Never>?
+    private var areaSelector: AreaSelectionController?
+    private var windowSelector: WindowSelectionController?
+    private var countdown: CaptureCountdown?
+    private var screenObserver: Any?
+    private(set) var isCapturing = false
 
-    private var lastCaptureMode: CaptureMode?
-    private var areaSelectionController: AreaSelectionController?
-
-    private init() {}
-
+    private init() {
+        screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                               object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.isCapturing else { return }
+            self.cancelActive(); UserNotice.show("The display configuration changed. Select the capture area again.")
+        }
+    }
     var autoSave: Bool { UserDefaults.standard.bool(forKey: "autoSave") }
     var autoCopy: Bool { UserDefaults.standard.object(forKey: "autoCopy") as? Bool ?? true }
     var showPreview: Bool { UserDefaults.standard.object(forKey: "showPreview") as? Bool ?? true }
@@ -119,466 +114,282 @@ final class CaptureService {
     var hideDesktopIcons: Bool { UserDefaults.standard.bool(forKey: "hideDesktopIcons") }
     var windowShadow: Bool { UserDefaults.standard.object(forKey: "windowShadow") as? Bool ?? true }
 
-    /// Pixel-per-point scale to capture at for a given screen. Honors the "downscale Retina to 1x"
-    /// setting; otherwise matches the display's native backing scale instead of assuming 2x.
-    private func captureScale(for screen: NSScreen?) -> Int {
-        if retinaDownscale { return 1 }
-        let factor = screen?.backingScaleFactor ?? 2
-        return max(1, Int(factor.rounded()))
-    }
-
-    private func setDesktopIconsVisible(_ visible: Bool) -> Bool {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-        task.arguments = ["write", "com.apple.finder", "CreateDesktop", "-bool", visible ? "true" : "false"]
-        do {
-            try task.run()
-        } catch {
-            return false
-        }
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else { return false }
-
-        let killall = Process()
-        killall.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        killall.arguments = ["Finder"]
-        try? killall.run()
-        killall.waitUntilExit()
-        return true
-    }
-
-    /// Returns true only when this capture changed Finder state and must restore it.
-    private func hideDesktopIconsIfNeeded() -> Bool {
-        guard hideDesktopIcons else { return false }
-        let finderDefaults = UserDefaults.standard.persistentDomain(forName: "com.apple.finder")
-        let wereVisible = finderDefaults?["CreateDesktop"] as? Bool ?? true
-        guard wereVisible, setDesktopIconsVisible(false) else { return false }
-
-        if hideDesktopIcons {
-            Thread.sleep(forTimeInterval: 0.5)
-        }
-        return true
-    }
-
-    private func restoreDesktopIconsIfNeeded(_ shouldRestore: Bool) {
-        guard shouldRestore else { return }
-        _ = setDesktopIconsVisible(true)
-    }
-
-    private func ensurePermission() -> Bool {
-        ScreenCapturePermission.ensureAccess()
-    }
-
-    func repeatLastCapture() {
-        guard let mode = lastCaptureMode else {
-            startAreaCapture()
-            return
-        }
-        switch mode {
+    func perform(_ intent: CaptureIntent) {
+        switch intent {
         case .area: startAreaCapture()
+        case .sensitiveArea: startAreaCapture(sensitive: true)
         case .fullscreen: captureFullscreen()
         case .window: captureWindow()
         case .delayed: captureWithDelay(seconds: 3)
         case .scrolling: ScrollingCaptureService.shared.startScrollingCapture()
+        case .colorPicker: ColorPickerService.shared.start()
         }
     }
 
-    func startAreaCapture() {
-        lastCaptureMode = .area
-        guard ensurePermission() else { return }
+    func cancelActive() {
+        session = UUID(); isCapturing = false
+        task?.cancel(); task = nil
+        areaSelector?.cancel(); areaSelector = nil
+        windowSelector?.cancel(); windowSelector = nil
+        countdown?.cancel(); countdown = nil
+    }
+    private func beginSession(_ intent: CaptureIntent) -> UUID? {
+        cancelActive()
+        guard ScreenCapturePermission.ensureAccess(intent: intent) else { return nil }
+        isCapturing = true
+        return session
+    }
+    private var mouseScreen: NSScreen? { NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main }
 
-        // Only one selection overlay may own the cursor and keyboard monitor at a time. Repeated
-        // menu/hotkey activation cancels the old session before constructing a new one.
-        areaSelectionController?.cancel()
-        let controller = AreaSelectionController()
-        areaSelectionController = controller
-        controller.beginSelection { [weak self, weak controller] result in
-            guard let self else { return }
-            if self.areaSelectionController === controller {
-                self.areaSelectionController = nil
-            }
+    func startAreaCapture(sensitive: Bool = false) {
+        guard let id = beginSession(sensitive ? .sensitiveArea : .area) else { return }
+        selectArea(id: id, policy: CapturePolicy(sensitive: sensitive))
+    }
+    private func selectArea(id: UUID, policy: CapturePolicy) {
+        guard session == id else { return }
+        let selector = AreaSelectionController(); areaSelector = selector
+        selector.beginSelection { [weak self] result in
+            guard let self, self.session == id else { return }
+            self.areaSelector = nil
             switch result {
-            case let .area(rect, displayID):
-                self.captureRect(rect, screenID: displayID)
-            case .frontmostWindow:
-                self.performWindowCapture(updateLastMode: true)
-            case .cancelled:
-                break
+            case .area(let rect, let displayID):
+                guard let screen = NSScreen.screens.first(where: { $0.displayID == displayID }) else { self.finishFailure(CaptureFailure.displayUnavailable, id: id); return }
+                self.captureDisplay(CaptureDisplaySnapshot(screen: screen), region: rect, mode: .area, id: id, policy: policy)
+            case .frontmostWindow: self.selectWindow(id: id, policy: policy)
+            case .cancelled: self.isCapturing = false
             }
         }
     }
-
     func captureFullscreen() {
-        performFullscreenCapture(mode: .fullscreen, updateLastMode: true)
+        let target = mouseScreen.map(CaptureDisplaySnapshot.init(screen:))
+        guard let id = beginSession(.fullscreen) else { return }
+        guard let target else { finishFailure(CaptureFailure.displayUnavailable, id: id); return }
+        captureDisplay(target, region: nil, mode: .fullscreen, id: id, policy: CapturePolicy())
     }
-
-    private func performFullscreenCapture(mode: CaptureMode, updateLastMode: Bool) {
-        if updateLastMode {
-            lastCaptureMode = mode
-        }
-        guard ensurePermission() else { return }
-        Task {
-            let shouldRestoreDesktopIcons = await MainActor.run { self.hideDesktopIconsIfNeeded() }
-            do {
-                guard let screen = NSScreen.main else { throw CaptureFailure.displayUnavailable }
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard let display = content.displays.first(where: { $0.displayID == screen.displayID }) else {
-                    throw CaptureFailure.displayUnavailable
-                }
-
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let config = SCStreamConfiguration()
-                let scaleFactor = self.captureScale(for: screen)
-                guard let outputSize = CaptureGeometry.outputPixelSize(
-                    logicalSize: CGSize(width: display.width, height: display.height),
-                    scale: scaleFactor
-                ) else { throw CaptureFailure.invalidCaptureRegion }
-                config.width = outputSize.width
-                config.height = outputSize.height
-                config.capturesAudio = false
-                config.showsCursor = false
-
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                let nsImage = NSImage(cgImage: image, size: NSSize(width: display.width, height: display.height))
-                await MainActor.run {
-                    self.restoreDesktopIconsIfNeeded(shouldRestoreDesktopIcons)
-                    self.playCaptureSound()
-                    self.handleCapturedImage(nsImage, source: mode, previewAnchor: screen.frame)
-                }
-            } catch {
-                await MainActor.run {
-                    self.restoreDesktopIconsIfNeeded(shouldRestoreDesktopIcons)
-                    self.presentCaptureError(error)
-                }
-            }
-        }
-    }
-
     func captureWindow() {
-        performWindowCapture(updateLastMode: true)
+        guard let id = beginSession(.window) else { return }
+        selectWindow(id: id, policy: CapturePolicy())
     }
-
-    private func performWindowCapture(updateLastMode: Bool) {
-        if updateLastMode {
-            lastCaptureMode = .window
-        }
-        guard ensurePermission() else { return }
-        Task {
+    private func selectWindow(id: UUID, policy: CapturePolicy) {
+        task = Task { [weak self] in
+            guard let self else { return }
             do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                let windows = content.windows.filter { $0.isOnScreen && $0.frame.width > 50 && $0.frame.height > 50 }
-
-                guard let frontWindow = windows.first(where: { $0.owningApplication?.bundleIdentifier != Bundle.main.bundleIdentifier }) else {
-                    throw CaptureFailure.windowUnavailable
+                let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+                guard self.session == id, !Task.isCancelled else { return }
+                let selector = WindowSelectionController(); self.windowSelector = selector
+                selector.begin(windows: content.windows) { [weak self] result in
+                    guard let self, self.session == id else { return }
+                    self.windowSelector = nil
+                    switch result {
+                    case .window(let window): self.captureSelectedWindow(window.windowID, processID: window.owningApplication?.processID ?? 0, id: id, policy: policy)
+                    case .area: self.selectArea(id: id, policy: policy)
+                    case .cancelled: self.isCapturing = false
+                    }
                 }
-
-                let previewAnchor = Self.appKitWindowFrame(
-                    windowFrame: frontWindow.frame,
-                    primaryScreenFrame: NSScreen.screens.first?.frame ?? .zero
-                )
-                let windowScreen = NSScreen.screens.first { $0.frame.intersects(previewAnchor) }
-                let filter = SCContentFilter(desktopIndependentWindow: frontWindow)
-                let config = SCStreamConfiguration()
-                let scaleFactor = self.captureScale(for: windowScreen)
-                guard let outputSize = CaptureGeometry.outputPixelSize(
-                    logicalSize: frontWindow.frame.size,
-                    scale: scaleFactor
-                ) else { throw CaptureFailure.invalidCaptureRegion }
-                config.width = outputSize.width
-                config.height = outputSize.height
-                config.capturesAudio = false
-                config.showsCursor = false
-
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                var nsImage = NSImage(cgImage: image, size: frontWindow.frame.size)
-                if self.windowShadow {
-                    nsImage = self.imageWithShadow(nsImage, scale: CGFloat(scaleFactor))
-                }
-                let finalImage = nsImage
-                await MainActor.run {
-                    self.playCaptureSound()
-                    self.handleCapturedImage(finalImage, source: .window, previewAnchor: previewAnchor)
-                }
-            } catch {
-                await MainActor.run { self.presentCaptureError(error) }
-            }
+            } catch { self.finishFailure(error, id: id) }
         }
     }
-
     func captureWithDelay(seconds: Int) {
-        lastCaptureMode = .delayed
-        guard ensurePermission() else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds)) {
-            self.performFullscreenCapture(mode: .delayed, updateLastMode: false)
-        }
+        let target = mouseScreen.map(CaptureDisplaySnapshot.init(screen:))
+        guard let id = beginSession(.delayed) else { return }
+        guard let target else { finishFailure(CaptureFailure.displayUnavailable, id: id); return }
+        let policy = CapturePolicy()
+        let countdown = CaptureCountdown(); self.countdown = countdown
+        countdown.start(seconds: seconds, screen: target.matchingScreen(), completion: { [weak self] in
+            guard let self, self.session == id else { return }
+            self.countdown = nil
+            self.captureDisplay(target, region: nil, mode: .delayed, id: id, policy: policy)
+        }, cancelled: { [weak self] in if self?.session == id { self?.isCapturing = false } })
     }
-
     func captureRect(_ rect: CGRect, screenID: CGDirectDisplayID) {
-        guard ensurePermission() else { return }
-        Task {
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard let display = content.displays.first(where: { $0.displayID == screenID }) else {
-                    throw CaptureFailure.displayUnavailable
-                }
-
-                guard let safeRect = CaptureGeometry.validatedSourceRect(
-                    rect,
-                    displaySize: CGSize(width: display.width, height: display.height)
-                ) else { throw CaptureFailure.invalidCaptureRegion }
-
-                let captureScreen = NSScreen.screens.first { $0.displayID == screenID }
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let config = SCStreamConfiguration()
-                config.sourceRect = safeRect
-                let scaleFactor = self.captureScale(for: captureScreen)
-                guard let outputSize = CaptureGeometry.outputPixelSize(
-                    logicalSize: safeRect.size,
-                    scale: scaleFactor
-                ) else { throw CaptureFailure.invalidCaptureRegion }
-                config.width = outputSize.width
-                config.height = outputSize.height
-                config.capturesAudio = false
-                config.showsCursor = false
-
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                let nsImage = NSImage(cgImage: image, size: safeRect.size)
-                let previewAnchor = captureScreen.map {
-                    Self.appKitCaptureFrame(sourceRect: safeRect, screenFrame: $0.frame)
-                }
-                await MainActor.run {
-                    self.playCaptureSound()
-                    self.handleCapturedImage(nsImage, source: .area, previewAnchor: previewAnchor)
-                }
-            } catch {
-                await MainActor.run { self.presentCaptureError(error) }
+        guard let id = beginSession(.area) else { return }
+        guard let screen = NSScreen.screens.first(where: { $0.displayID == screenID }) else { finishFailure(CaptureFailure.displayUnavailable, id: id); return }
+        captureDisplay(CaptureDisplaySnapshot(screen: screen), region: rect, mode: .area, id: id, policy: CapturePolicy())
+    }
+    func repeatLastCapture() {
+        guard let last = lastCapture else { startAreaCapture(); return }
+        guard let id = beginSession(last.sensitive ? .sensitiveArea : .area) else { return }
+        let policy = CapturePolicy(sensitive: last.sensitive)
+        switch last.target {
+        case .display(let display, let rect, let mode):
+            guard display.matchingScreen() != nil else {
+                UserNotice.show("The display configuration changed. Select the capture area again.")
+                selectArea(id: id, policy: policy); return
             }
+            captureDisplay(display, region: rect, mode: mode, id: id, policy: policy)
+        case .window(let windowID, let processID): captureSelectedWindow(windowID, processID: processID, id: id, policy: policy)
         }
     }
 
-    func handleCapturedImage(
-        _ image: NSImage,
-        source mode: CaptureMode,
-        previewAnchor: CGRect? = nil
-    ) {
-        let options = CaptureCompletionOptions(
-            showPreview: UserDefaults.standard.object(forKey: "showPreview") as? Bool,
-            autoCopy: UserDefaults.standard.object(forKey: "autoCopy") as? Bool,
-            autoSave: autoSave
-        )
+    /// Reused by scrolling capture: immutable target, explicit filtering and no global side effects.
+    static func captureFrame(display snapshot: CaptureDisplaySnapshot, region: CGRect?, downscale: Bool, hideDesktopIcons: Bool) async throws -> (CGImage, CGSize) {
+        guard let screen = snapshot.matchingScreen() else { throw CaptureFailure.displayUnavailable }
+        guard CGPreflightScreenCaptureAccess() else { throw CaptureFailure.permissionUnavailable }
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        try Task.checkCancellation()
+        guard snapshot.matchingScreen() != nil, let display = content.displays.first(where: { $0.displayID == snapshot.id }) else { throw CaptureFailure.displayUnavailable }
+        let logicalSize: CGSize
+        let safeRegion: CGRect?
+        if let region {
+            guard let safe = CaptureGeometry.validatedSourceRect(region, displaySize: screen.frame.size) else { throw CaptureFailure.invalidCaptureRegion }
+            safeRegion = safe; logicalSize = safe.size
+        } else { safeRegion = nil; logicalSize = screen.frame.size }
+        let scale = downscale ? 1 : max(1, Int(snapshot.backingScale.rounded()))
+        guard let pixels = CaptureGeometry.outputPixelSize(logicalSize: logicalSize, scale: scale) else { throw CaptureFailure.invalidCaptureRegion }
+        let excluded = content.windows.filter {
+            CaptureGeometry.excludesWindow(owner: $0.owningApplication?.bundleIdentifier, layer: $0.windowLayer,
+                ownBundle: Bundle.main.bundleIdentifier, hideDesktopIcons: hideDesktopIcons)
+        }
+        let filter = SCContentFilter(display: display, excludingWindows: excluded)
+        let configuration = SCStreamConfiguration()
+        configuration.width = pixels.width; configuration.height = pixels.height
+        configuration.capturesAudio = false; configuration.showsCursor = false
+        if let safeRegion { configuration.sourceRect = safeRegion }
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        try Task.checkCancellation()
+        guard snapshot.matchingScreen() != nil else { throw CaptureFailure.displayUnavailable }
+        return (image, logicalSize)
+    }
 
+    private func captureDisplay(_ display: CaptureDisplaySnapshot, region: CGRect?, mode: CaptureMode, id: UUID, policy: CapturePolicy) {
+        let downscale = retinaDownscale, hideIcons = hideDesktopIcons
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                // Give a dismissed selection overlay one compositing turn before capture.
+                try await Task.sleep(for: .milliseconds(40))
+                let (raster, size) = try await Self.captureFrame(display: display, region: region, downscale: downscale, hideDesktopIcons: hideIcons)
+                guard self.session == id, !Task.isCancelled else { return }
+                self.lastCapture = (.display(display, region, mode), policy.sensitive)
+                let anchor = region.map { Self.appKitCaptureFrame(sourceRect: $0, screenFrame: display.frame) } ?? display.frame
+                self.isCapturing = false
+                self.handleCapturedImage(NSImage(cgImage: raster, size: size), source: mode, previewAnchor: anchor, policy: policy)
+            } catch is CancellationError { }
+            catch { self.finishFailure(error, id: id) }
+        }
+    }
+    private func captureSelectedWindow(_ windowID: CGWindowID, processID: pid_t, id: UUID, policy: CapturePolicy) {
+        let downscale = retinaDownscale, shadow = windowShadow
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(40))
+                let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+                guard let window = content.windows.first(where: { $0.windowID == windowID && $0.owningApplication?.processID == processID && $0.isOnScreen }) else { throw CaptureFailure.windowUnavailable }
+                let frame = ScreenCoordinates.appKitRect(fromQuartz: window.frame, primaryTop: ScreenCoordinates.primaryTop)
+                let screen = NSScreen.screens.max { $0.frame.intersection(frame).safeArea < $1.frame.intersection(frame).safeArea }
+                let scale = downscale ? 1 : max(1, Int(screen?.backingScaleFactor.rounded() ?? 1))
+                guard let pixels = CaptureGeometry.outputPixelSize(logicalSize: window.frame.size, scale: scale) else { throw CaptureFailure.invalidCaptureRegion }
+                let configuration = SCStreamConfiguration()
+                configuration.width = pixels.width; configuration.height = pixels.height
+                configuration.showsCursor = false; configuration.capturesAudio = false
+                configuration.ignoreShadowsSingleWindow = true
+                let raster = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window), configuration: configuration)
+                guard self.session == id, !Task.isCancelled else { return }
+                let image = shadow ? try Self.withShadow(raster, logicalSize: window.frame.size, scale: CGFloat(scale)) : NSImage(cgImage: raster, size: window.frame.size)
+                self.lastCapture = (.window(windowID, processID), policy.sensitive)
+                self.isCapturing = false
+                self.handleCapturedImage(image, source: .window, previewAnchor: frame, policy: policy)
+            } catch is CancellationError { }
+            catch { self.finishFailure(error, id: id) }
+        }
+    }
+
+    func handleCapturedImage(_ image: NSImage, source mode: CaptureMode, previewAnchor: CGRect? = nil, policy: CapturePolicy? = nil) {
+        let policy = policy ?? CapturePolicy()
         StatusBarAnimator.shared.flash(type: .capture)
-
-        // Clipboard and preview are the user-visible completion path, so finish them before any
-        // image encoding or disk writes. This keeps large Retina captures feeling immediate.
-        if options.autoCopy {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
+        if captureSound { NSSound(named: "Tink")?.play() }
+        if policy.autoCopy {
+            NSPasteboard.general.clearContents()
+            if !NSPasteboard.general.writeObjects([image]) { UserNotice.show("The clipboard could not be updated. The screenshot is still available.") }
         }
-
-        if options.showPreview {
-            ThumbnailPreviewController.shared.show(image: image, anchorRect: previewAnchor)
-        }
-
-        guard let snapshot = CapturedImageSnapshot(image: image) else { return }
-        HistoryManager.shared.add(snapshot: snapshot, source: mode.historySource)
-
-        if options.autoSave {
-            saveSnapshotInBackground(snapshot)
-        }
-    }
-
-    private func saveSnapshotInBackground(_ snapshot: CapturedImageSnapshot) {
-        let expandedPath = NSString(string: saveLocation).expandingTildeInPath
-        let directory = URL(fileURLWithPath: expandedPath)
-        let format = ImageFormat(rawValue: imageFormat) ?? .png
-
-        Task.detached(priority: .utility) {
-            do {
-                guard let data = snapshot.data(format: format) else {
-                    throw ImageSaveError.encodingFailed
-                }
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let url = CaptureService.uniqueScreenshotURL(in: directory, format: format)
-                try data.write(to: url, options: .atomic)
-            } catch {
-                await MainActor.run {
-                    CaptureService.shared.presentCaptureError(
-                        error,
-                        title: L10n.string("Screenshot Saved to History Only")
-                    )
-                }
+        RecentCaptureStore.shared.add(image: image, source: mode.historySource, sensitive: policy.sensitive)
+        if policy.directEdit { openEditor(with: image, sensitive: policy.sensitive) }
+        else if policy.preview { ThumbnailPreviewController.shared.show(image: image, anchorRect: previewAnchor) }
+        guard !policy.sensitive, let snapshot = CapturedImageSnapshot(image: image) else { return }
+        if policy.persistentHistory { HistoryManager.shared.add(snapshot: snapshot, source: mode.historySource) }
+        if policy.autoSave {
+            let directory = URL(fileURLWithPath: NSString(string: policy.destination).expandingTildeInPath, isDirectory: true)
+            let frozenOptions = policy.exportOptions
+            Task.detached(priority: .utility) {
+                do { _ = try ExportService.saveUnique(snapshot, options: frozenOptions, in: directory) }
+                catch { await MainActor.run { UserNotice.show("Automatic save failed. Your screenshot is still available in this session.", detail: error.localizedDescription, duration: 10) } }
             }
         }
     }
-
-    func openEditor(with image: NSImage) {
-        DispatchQueue.main.async {
-            let editorWindow = EditorWindowController(image: image)
-            editorWindow.showWindow(nil)
-        }
+    func openEditor(with image: NSImage, sensitive: Bool = false) {
+        EditorWindowController(image: image, sensitive: sensitive).showWindow(nil)
     }
-
     @discardableResult
     func saveImageToConfiguredLocation(_ image: NSImage) throws -> URL {
-        let expandedPath = NSString(string: saveLocation).expandingTildeInPath
-        let dir = URL(fileURLWithPath: expandedPath)
-        let format = ImageFormat(rawValue: imageFormat) ?? .png
-
-        guard let data = image.data(format: format) else { throw ImageSaveError.encodingFailed }
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = Self.uniqueScreenshotURL(in: dir, format: format)
-        try data.write(to: url, options: .atomic)
-        return url
+        guard let snapshot = CapturedImageSnapshot(image: image) else { throw ImageSaveError.encodingFailed }
+        let directory = URL(fileURLWithPath: NSString(string: saveLocation).expandingTildeInPath, isDirectory: true)
+        return try ExportService.saveUnique(snapshot, options: .current, in: directory)
     }
-
-    nonisolated static func uniqueScreenshotURL(
-        in directory: URL,
-        format: ImageFormat,
-        date: Date = Date(),
-        fileManager: FileManager = .default
-    ) -> URL {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss-SSS"
+    /// Compatibility helper for suggested names; actual writes use an atomic no-overwrite claim.
+    nonisolated static func uniqueScreenshotURL(in directory: URL, format: ImageFormat, date: Date = Date(), fileManager: FileManager = .default) -> URL {
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss-SSS"
         let base = "Screenshot_\(formatter.string(from: date))"
-
-        var candidate = directory.appendingPathComponent("\(base).\(format.fileExtension)")
-        var suffix = 2
-        while fileManager.fileExists(atPath: candidate.path) {
-            candidate = directory.appendingPathComponent("\(base)-\(suffix).\(format.fileExtension)")
-            suffix += 1
-        }
-        return candidate
+        var result = directory.appendingPathComponent("\(base).\(format.fileExtension)"), suffix = 2
+        while fileManager.fileExists(atPath: result.path) { result = directory.appendingPathComponent("\(base)-\(suffix).\(format.fileExtension)"); suffix += 1 }
+        return result
     }
-
-    /// ScreenCaptureKit's display source rectangle uses a top-left origin relative to one
-    /// display. Preview windows use AppKit's global bottom-left coordinate space.
     nonisolated static func appKitCaptureFrame(sourceRect: CGRect, screenFrame: CGRect) -> CGRect {
-        CGRect(
-            x: screenFrame.minX + sourceRect.minX,
-            y: screenFrame.maxY - sourceRect.maxY,
-            width: sourceRect.width,
-            height: sourceRect.height
-        )
+        CGRect(x: screenFrame.minX + sourceRect.minX, y: screenFrame.maxY - sourceRect.maxY, width: sourceRect.width, height: sourceRect.height)
     }
-
-    /// Global Quartz coordinates originate at the top-left of the menu-bar display, not
-    /// the current/main window's display. AppKit's global coordinates originate bottom-left.
     nonisolated static func appKitWindowFrame(windowFrame: CGRect, primaryScreenFrame: CGRect) -> CGRect {
-        CGRect(x: windowFrame.minX, y: primaryScreenFrame.maxY - windowFrame.maxY,
-               width: windowFrame.width, height: windowFrame.height)
+        ScreenCoordinates.appKitRect(fromQuartz: windowFrame, primaryTop: primaryScreenFrame.maxY)
     }
-
-    private func presentCaptureError(_ error: Error, title: String = "Screenshot Failed") {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = title
-        alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+    private func finishFailure(_ error: Error, id: UUID) {
+        guard session == id else { return }; isCapturing = false
+        UserNotice.show("Screenshot could not be completed", detail: error.localizedDescription, duration: 10)
+        PermissionCoordinator.shared.refresh()
     }
-
-    /// Composites a drop shadow behind a captured window, preserving the source resolution.
-    private func imageWithShadow(_ image: NSImage, scale: CGFloat) -> NSImage {
-        guard let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let cg = rep.cgImage else { return image }
-
-        let pxW = rep.pixelsWide
-        let pxH = rep.pixelsHigh
-        let margin = Int((50 * scale).rounded())
-        let w = pxW + margin * 2
-        let h = pxH + margin * 2
-
-        guard let ctx = CGContext(
-            data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return image }
-
-        ctx.setShadow(
-            offset: CGSize(width: 0, height: -18 * scale),
-            blur: 35 * scale,
-            color: NSColor.black.withAlphaComponent(0.35).cgColor
-        )
-        ctx.draw(cg, in: CGRect(x: margin, y: margin, width: pxW, height: pxH))
-
-        guard let out = ctx.makeImage() else { return image }
-        return NSImage(cgImage: out, size: NSSize(width: CGFloat(w) / scale, height: CGFloat(h) / scale))
-    }
-
-    private func playCaptureSound() {
-        guard captureSound else { return }
-        NSSound(named: "Tink")?.play()
+    private static func withShadow(_ image: CGImage, logicalSize: CGSize, scale: CGFloat) throws -> NSImage {
+        let margin = Int(32 * scale), width = image.width + 2 * margin, height = image.height + 2 * margin
+        guard width * height <= CaptureGeometry.maximumPixelCount, width <= CaptureGeometry.maximumPixelDimension,
+              height <= CaptureGeometry.maximumPixelDimension,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw RenderFailure.tooLarge }
+        context.setShadow(offset: CGSize(width: 0, height: -8 * scale), blur: 16 * scale, color: CGColor(gray: 0, alpha: 0.3))
+        context.draw(image, in: CGRect(x: margin, y: margin, width: image.width, height: image.height))
+        guard let result = context.makeImage() else { throw RenderFailure.allocationFailed }
+        return NSImage(cgImage: result, size: CGSize(width: CGFloat(width) / scale, height: CGFloat(height) / scale))
     }
 }
 
-/// Supported export formats for saved screenshots.
-enum ImageFormat: String, CaseIterable {
+private extension CGRect { var safeArea: CGFloat { isNull || isInfinite ? 0 : width * height } }
+
+enum ImageFormat: String, CaseIterable, Sendable {
     case png, jpeg, tiff
-
     nonisolated var fileExtension: String { rawValue }
-    var displayName: String {
-        switch self {
-        case .png: return "PNG"
-        case .jpeg: return "JPEG"
-        case .tiff: return "TIFF"
-        }
-    }
+    var displayName: String { rawValue.uppercased() }
 }
 
-/// Immutable representation suitable for image encoding away from the main thread.
 struct CapturedImageSnapshot: @unchecked Sendable {
     let cgImage: CGImage
     let logicalSize: CGSize
-
     init?(image: NSImage) {
-        var proposedRect = NSRect(origin: .zero, size: image.size)
-        guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
-            return nil
+        if let bitmap = image.representations.compactMap({ $0 as? NSBitmapImageRep })
+            .max(by: { $0.pixelsWide * $0.pixelsHigh < $1.pixelsWide * $1.pixelsHigh }), let raster = bitmap.cgImage {
+            cgImage = raster; logicalSize = image.size; return
         }
-        self.cgImage = cgImage
-        self.logicalSize = image.size
+        var rect = NSRect(origin: .zero, size: image.size)
+        guard let raster = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return nil }
+        cgImage = raster; logicalSize = image.size
     }
-
+    nonisolated init(cgImage: CGImage, logicalSize: CGSize) { self.cgImage = cgImage; self.logicalSize = logicalSize }
     nonisolated func data(format: ImageFormat, compression: CGFloat = 0.9) -> Data? {
-        let type: CFString
-        switch format {
-        case .png: type = UTType.png.identifier as CFString
-        case .jpeg: type = UTType.jpeg.identifier as CFString
-        case .tiff: type = UTType.tiff.identifier as CFString
-        }
-
-        let output = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(output, type, 1, nil) else {
-            return nil
-        }
-        let properties: CFDictionary? = format == .jpeg
-            ? [kCGImageDestinationLossyCompressionQuality: compression] as CFDictionary
-            : nil
-        CGImageDestinationAddImage(destination, cgImage, properties)
-        guard CGImageDestinationFinalize(destination) else { return nil }
-        return output as Data
+        try? ExportService.encode(cgImage, options: ExportOptions(format: format, quality: Double(compression)))
     }
 }
 
 extension NSImage {
-    /// Encodes the image to the given format. JPEG uses the supplied compression quality (0…1).
     func data(format: ImageFormat, compression: CGFloat = 0.9) -> Data? {
-        guard let tiff = tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return nil }
-        switch format {
-        case .png: return rep.representation(using: .png, properties: [:])
-        case .jpeg: return rep.representation(using: .jpeg, properties: [.compressionFactor: compression])
-        case .tiff: return rep.representation(using: .tiff, properties: [:])
-        }
+        CapturedImageSnapshot(image: self)?.data(format: format, compression: compression)
     }
 }
-
 extension NSScreen {
-    var displayID: CGDirectDisplayID {
-        let key = NSDeviceDescriptionKey("NSScreenNumber")
-        return deviceDescription[key] as? CGDirectDisplayID ?? 0
-    }
+    var displayID: CGDirectDisplayID { deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0 }
 }

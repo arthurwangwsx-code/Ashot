@@ -2,377 +2,190 @@ import SwiftUI
 import AppKit
 
 struct EditorView: View {
-    let image: NSImage
-    @State private var viewModel: EditorViewModel
-    @State private var pasteMonitor: Any?
-    @State private var eventScope = EditorEventScope()
-
-    init(image: NSImage) {
-        self.image = image
-        _viewModel = State(wrappedValue: EditorViewModel(image: image))
-    }
+    @Bindable var viewModel: EditorViewModel
+    @State private var monitor: Any?
+    @State private var scope = EditorEventScope()
+    @State private var showBeautifier = false
 
     var body: some View {
         VStack(spacing: 0) {
             EditorToolbar(viewModel: viewModel)
+            if viewModel.document.sensitive {
+                Label("Sensitive capture: the original is not copied or saved automatically.", systemImage: "lock.shield")
+                    .font(.caption).padding(8).frame(maxWidth: .infinity, alignment: .leading)
+            }
             Divider()
             ZStack {
-                CanvasView(viewModel: viewModel)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                if viewModel.showOCRResult {
-                    OCRResultOverlay(viewModel: viewModel)
-                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                }
+                CanvasView(viewModel: viewModel).frame(maxWidth: .infinity, maxHeight: .infinity)
+                if viewModel.showOCRResult { OCRResultOverlay(viewModel: viewModel) }
             }
-            .animation(.spring(duration: 0.25), value: viewModel.showOCRResult)
             Divider()
-            EditorBottomBar(viewModel: viewModel)
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .background(EditorWindowReader(scope: eventScope))
-        .onAppear {
-            guard pasteMonitor == nil else { return }
-            pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                guard event.window === eventScope.window else { return event }
-
-                // A single-letter tool shortcut must never steal text from the field editor or
-                // an active IME composition.
-                if eventScope.window?.firstResponder is NSTextView {
-                    return event
+            HStack(spacing: 12) {
+                Text("\(Int(viewModel.canvasSize.width)) × \(Int(viewModel.canvasSize.height)) pt")
+                    .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                Button("Fit") { viewModel.zoomScale = 1; viewModel.panOffset = .zero }
+                Text("\(Int(viewModel.zoomScale * 100))%")
+                    .font(.system(.caption, design: .monospaced)).accessibilityLabel(Text("Zoom"))
+                Spacer(minLength: 4)
+                if let icon = NSImage(systemSymbolName: "arrow.up.doc", accessibilityDescription: L10n.string("Drag image to export")) {
+                    ImageDragView(image: icon, snapshotProvider: {
+                        do { return CapturedImageSnapshot(image: try viewModel.renderFinalImage()) }
+                        catch { viewModel.exportError = error.localizedDescription; return nil }
+                    }).frame(width: 24, height: 24).help("Drag image to export")
                 }
-
-                if event.modifierFlags.contains(.command),
-                   event.charactersIgnoringModifiers?.lowercased() == "v" {
-                    if let image = NSImage(pasteboard: NSPasteboard.general) {
-                        viewModel.pasteImage(image)
-                        return nil
+                if viewModel.isExporting { ProgressView().controlSize(.small) }
+                if let feedback = viewModel.feedback { Text(feedback).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                Menu {
+                    Button("Pin", action: viewModel.pinAsFloating)
+                    Button("Beautify") { showBeautifier = true }
+                    Button("Reset Crop", action: viewModel.resetCrop).disabled(viewModel.cropRect == nil)
+                } label: { Image(systemName: "ellipsis.circle") }
+                .menuStyle(.borderlessButton).frame(width: 28).accessibilityLabel(Text("Image Actions"))
+                Button("Copy", action: viewModel.copyToClipboard).help("Copy image (⌘C)")
+                Button("Save") { viewModel.saveToFile() }.buttonStyle(.borderedProminent).help("Save image (⌘S)")
+            }
+            .controlSize(.small).padding(10).background(.bar).disabled(viewModel.isExporting)
+        }
+        .background(EditorWindowReader(scope: scope))
+        .sheet(isPresented: $showBeautifier) { BackgroundBeautifierView(viewModel: viewModel) }
+        .alert("The action could not be completed", isPresented: Binding(get: { viewModel.exportError != nil }, set: { if !$0 { viewModel.exportError = nil } })) {
+            Button("OK", role: .cancel) { viewModel.exportError = nil }
+        } message: { Text(viewModel.exportError ?? "") }
+        .onAppear {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                guard event.window === scope.window, !(scope.window?.firstResponder is NSTextView) else { return event }
+                if event.modifierFlags.contains(.command) {
+                    switch event.charactersIgnoringModifiers?.lowercased() {
+                    case "v":
+                        if let image = NSImage(pasteboard: .general) { viewModel.pasteImage(image); return nil }
+                    case "c": viewModel.copyToClipboard(); return nil
+                    case "s": viewModel.saveToFile(); return nil
+                    case "z": event.modifierFlags.contains(.shift) ? viewModel.redo() : viewModel.undo(); return nil
+                    case "d": viewModel.duplicateSelected(); return nil
+                    case "0": viewModel.zoomScale = 1; viewModel.panOffset = .zero; return nil
+                    default: break
                     }
                 }
-
-                guard !viewModel.showOCRResult,
-                      let action = EditorShortcutManager.shared.action(for: event) else {
-                    return event
-                }
+                guard !viewModel.showOCRResult, let action = EditorShortcutManager.shared.action(for: event) else { return event }
                 viewModel.selectedTool = action.tool
                 return nil
             }
         }
-        .onDisappear {
-            if let pasteMonitor {
-                NSEvent.removeMonitor(pasteMonitor)
-                self.pasteMonitor = nil
-            }
-        }
+        .onDisappear { if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }; viewModel.cancelRecognition() }
     }
 }
 
-@MainActor
-private final class EditorEventScope {
-    weak var window: NSWindow?
-}
-
+private final class EditorEventScope { weak var window: NSWindow? }
 private struct EditorWindowReader: NSViewRepresentable {
     let scope: EditorEventScope
-
-    func makeNSView(context: Context) -> WindowReportingView {
-        let view = WindowReportingView()
-        view.onWindowChange = { [weak scope] window in scope?.window = window }
-        return view
+    func makeNSView(context: Context) -> Reporter {
+        let view = Reporter(); view.onChange = { [weak scope] in scope?.window = $0 }; return view
     }
-
-    func updateNSView(_ nsView: WindowReportingView, context: Context) {
-        nsView.onWindowChange = { [weak scope] window in scope?.window = window }
-    }
-
-    final class WindowReportingView: NSView {
-        var onWindowChange: ((NSWindow?) -> Void)?
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            onWindowChange?(window)
-        }
-    }
-}
-
-struct OCRResultOverlay: View {
-    var viewModel: EditorViewModel
-    @AppStorage("ocrStripLinebreaks") private var stripLinebreaks: Bool = false
-
-    var displayText: String {
-        if stripLinebreaks {
-            return viewModel.ocrText.replacingOccurrences(of: "\n", with: " ")
-        }
-        return viewModel.ocrText
-    }
-
-    var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Image(systemName: "text.viewfinder")
-                    .foregroundColor(.accentColor)
-                Text("OCR Result")
-                    .font(.headline)
-                Spacer()
-                Button(action: { viewModel.showOCRResult = false }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 16))
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-
-            ScrollView {
-                Text(displayText)
-                    .font(.system(.body, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .frame(maxHeight: 200)
-
-            Divider()
-
-            HStack {
-                Toggle("Strip linebreaks", isOn: $stripLinebreaks)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                Spacer()
-                Button(action: {
-                    let text = stripLinebreaks ? displayText : viewModel.ocrText
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(text, forType: .string)
-                }) {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
-                .buttonStyle(.bordered)
-            }
-        }
-        .padding(16)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.15), radius: 20, y: 8)
-        .padding(24)
-        .frame(maxWidth: 500)
+    func updateNSView(_ view: Reporter, context: Context) { scope.window = view.window }
+    final class Reporter: NSView {
+        var onChange: ((NSWindow?) -> Void)?
+        override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); onChange?(window) }
     }
 }
 
 struct EditorToolbar: View {
     @Bindable var viewModel: EditorViewModel
-
     var body: some View {
-        HStack(spacing: 6) {
-            ToolButton(icon: "arrow.up.left", tool: .select, viewModel: viewModel)
-
-            ToolDivider()
-
-            HStack(spacing: 4) {
-                ToolButton(icon: "arrow.right", tool: .arrow, viewModel: viewModel)
-                ToolButton(icon: "line.diagonal", tool: .line, viewModel: viewModel)
-                ToolButton(icon: "rectangle", tool: .rectangle, viewModel: viewModel)
-                ToolButton(icon: "circle", tool: .oval, viewModel: viewModel)
-                ToolButton(icon: "pencil.line", tool: .freehand, viewModel: viewModel)
-                ToolButton(icon: "textformat", tool: .text, viewModel: viewModel)
-                ToolButton(icon: "number", tool: .counter, viewModel: viewModel)
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                tool(.select, "arrow.up.left")
+                tool(.arrow, "arrow.right")
+                tool(.rectangle, "rectangle")
+                tool(.text, "textformat")
+                tool(.redact, "rectangle.fill")
+                tool(.crop, "crop")
+                Menu {
+                    ForEach([AnnotationTool.line, .oval, .freehand, .counter, .highlight, .blur, .pixelate, .ruler, .ocr], id: \.rawValue) { type in
+                        Button(type.displayName) { viewModel.selectedTool = type }
+                    }
+                    Button("Recognize Text") { viewModel.performOCR() }
+                    Button("Recognize QR / Barcode", action: viewModel.performQRDetection)
+                    Button("Color Picker") { viewModel.selectedTool = .colorPicker }
+                } label: { Label("More Tools", systemImage: "ellipsis") }
+                Spacer()
+                Button(action: viewModel.undo) { Image(systemName: "arrow.uturn.backward") }
+                    .disabled(!viewModel.canUndo).help(viewModel.undoTitle + " (⌘Z)").accessibilityLabel(Text("Undo"))
+                Button(action: viewModel.redo) { Image(systemName: "arrow.uturn.forward") }
+                    .disabled(!viewModel.canRedo).help(viewModel.redoTitle + " (⇧⌘Z)").accessibilityLabel(Text("Redo"))
+                Button(action: viewModel.deleteSelected) { Image(systemName: "trash") }
+                    .disabled(viewModel.selectedAnnotationID == nil).help("Delete selected").accessibilityLabel(Text("Delete selected"))
             }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 3)
-            .background(Color.primary.opacity(0.03))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            ToolDivider()
-
-            HStack(spacing: 4) {
-                ToolButton(icon: "eye.slash", tool: .blur, viewModel: viewModel)
-                ToolButton(icon: "square.grid.3x3.fill", tool: .pixelate, viewModel: viewModel)
-                ToolButton(icon: "highlighter", tool: .highlight, viewModel: viewModel)
+            .buttonStyle(.borderless)
+            HStack(spacing: 12) {
+                Text(viewModel.selectedAnnotation == nil ? L10n.string("New Annotation") : L10n.string("Selected Annotation"))
+                    .font(.caption).foregroundStyle(.secondary)
+                ColorPicker("Color", selection: $viewModel.strokeColor).labelsHidden()
+                    .disabled(viewModel.selectedAnnotation?.type == .redact).accessibilityLabel(Text("Annotation Color"))
+                Slider(value: $viewModel.strokeWidth, in: 1...20, step: 1, onEditingChanged: { editing in
+                    editing ? viewModel.beginTransaction(L10n.string("Change Style")) : viewModel.endTransaction()
+                }).frame(width: 100).accessibilityLabel(Text("Stroke Width / Text Size"))
+                if viewModel.selectedAnnotation?.type == .text {
+                    TextField("Annotation Text", text: Binding(get: { viewModel.selectedAnnotation?.text ?? "" }, set: viewModel.updateSelectedText), onEditingChanged: { editing in
+                        editing ? viewModel.beginTransaction(L10n.string("Edit Text")) : viewModel.endTransaction()
+                    }).textFieldStyle(.roundedBorder)
+                } else if [.redact, .blur, .pixelate].contains(viewModel.selectedTool) {
+                    Text(viewModel.selectedTool == .redact ? "Solid redaction exports opaque pixels. Earlier copies may still exist." : "Blur and pixelation are visual effects, not secure erasure.")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                } else { Spacer() }
             }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 3)
-            .background(Color.primary.opacity(0.03))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            ToolDivider()
-
-            HStack(spacing: 4) {
-                ToolButton(icon: "crop", tool: .crop, viewModel: viewModel)
-                ToolButton(icon: "ruler", tool: .ruler, viewModel: viewModel)
-                ToolButton(icon: "eyedropper", tool: .colorPicker, viewModel: viewModel)
-                ToolButton(icon: "text.viewfinder", tool: .ocr, viewModel: viewModel)
-            }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 3)
-            .background(Color.primary.opacity(0.03))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            Spacer()
-
-            ColorPicker("", selection: $viewModel.strokeColor)
-                .labelsHidden()
-                .frame(width: 30)
-
-            Slider(value: $viewModel.strokeWidth, in: 1...10, step: 1)
-                .frame(width: 80)
-                .controlSize(.small)
-
-            ToolDivider()
-
-            HStack(spacing: 4) {
-                Button(action: viewModel.undo) {
-                    Image(systemName: "arrow.uturn.backward")
-                        .font(.system(size: 13))
-                }
-                .buttonStyle(.plain)
-                .disabled(viewModel.annotations.isEmpty)
-                .keyboardShortcut("z", modifiers: .command)
-                .opacity(viewModel.annotations.isEmpty ? 0.4 : 1.0)
-
-                Button(action: viewModel.redo) {
-                    Image(systemName: "arrow.uturn.forward")
-                        .font(.system(size: 13))
-                }
-                .buttonStyle(.plain)
-                .disabled(viewModel.redoStack.isEmpty)
-                .keyboardShortcut("z", modifiers: [.command, .shift])
-                .opacity(viewModel.redoStack.isEmpty ? 0.4 : 1.0)
-            }
-
-            if viewModel.selectedAnnotationID != nil {
-                Button(action: viewModel.deleteSelected) {
-                    Image(systemName: "trash")
-                        .font(.system(size: 13))
-                        .foregroundColor(.red)
-                }
-                .buttonStyle(.plain)
-                .help("Delete selected")
-                .transition(.scale.combined(with: .opacity))
-            }
+            .controlSize(.small)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.bar)
-        .animation(.easeInOut(duration: 0.2), value: viewModel.selectedAnnotationID != nil)
+        .padding(10).background(.bar)
     }
-}
-
-private struct ToolDivider: View {
-    var body: some View {
-        Divider().frame(height: 20).padding(.horizontal, 2)
-    }
-}
-
-struct ToolButton: View {
-    let icon: String
-    let tool: AnnotationTool
-    var viewModel: EditorViewModel
-    var shortcutManager = EditorShortcutManager.shared
-    @State private var isHovered = false
-
-    private var isSelected: Bool { viewModel.selectedTool == tool }
-
-    var body: some View {
-        Button(action: { viewModel.selectedTool = tool }) {
-            Image(systemName: icon)
-                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
-                .frame(width: 30, height: 30)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(isSelected ? Color.accentColor.opacity(0.2) : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
-                )
+    private func tool(_ type: AnnotationTool, _ symbol: String) -> some View {
+        Button { viewModel.selectedTool = type } label: {
+            Image(systemName: symbol).frame(width: 30, height: 28)
+                .background(viewModel.selectedTool == type ? Color.accentColor.opacity(0.18) : .clear, in: RoundedRectangle(cornerRadius: 5))
         }
-        .buttonStyle(.plain)
-        .onHover { isHovered = $0 }
-        .help(shortcutManager.binding(for: tool).map { "\(tool.displayName) (\($0))" } ?? tool.displayName)
-        .animation(.easeInOut(duration: 0.12), value: isHovered)
-        .animation(.easeInOut(duration: 0.15), value: isSelected)
+        .help(EditorShortcutManager.shared.binding(for: type).map { "\(type.displayName) (\($0))" } ?? type.displayName)
+        .accessibilityLabel(type.displayName).accessibilityAddTraits(viewModel.selectedTool == type ? .isSelected : [])
     }
 }
 
-struct EditorBottomBar: View {
+struct OCRResultOverlay: View {
     @Bindable var viewModel: EditorViewModel
-
+    @AppStorage("ocrStripLinebreaks") private var strip = false
+    @AppStorage("ocrLanguage") private var language = "auto"
     var body: some View {
-        HStack(spacing: 12) {
-            Text("\(Int(viewModel.image.size.width)) × \(Int(viewModel.image.size.height))")
-                .font(.system(.caption, design: .monospaced))
-                .foregroundColor(.secondary)
-
-            Divider().frame(height: 16)
-
-            HStack(spacing: 4) {
-                Button(action: { viewModel.zoomScale = max(0.25, viewModel.zoomScale / 1.25) }) {
-                    Image(systemName: "minus")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-
-                Text("\(Int(viewModel.zoomScale * 100))%")
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(width: 40)
-                    .foregroundColor(.secondary)
-
-                Button(action: { viewModel.zoomScale = min(5.0, viewModel.zoomScale * 1.25) }) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-
-                Button(action: { viewModel.zoomScale = 1.0; viewModel.panOffset = .zero }) {
-                    Text("Fit")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(viewModel.recognitionIsBarcode ? "QR / Barcode Result" : "OCR Result").font(.headline)
+                Spacer()
+                Button(action: viewModel.closeRecognition) { Image(systemName: "xmark") }.accessibilityLabel(Text("Close"))
             }
-
-            Spacer()
-
-            HStack(spacing: 8) {
-                Button(action: { viewModel.pinAsFloating() }) {
-                    Label("Pin", systemImage: "pin")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button(action: { openBeautifier() }) {
-                    Label("Beautify", systemImage: "wand.and.stars")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button(action: { viewModel.copyToClipboard() }) {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .keyboardShortcut("c", modifiers: .command)
-
-                Button(action: { viewModel.saveToFile() }) {
-                    Label("Save", systemImage: "square.and.arrow.down")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .keyboardShortcut("s", modifiers: .command)
+            if viewModel.isRecognizing { ProgressView("Recognizing on this Mac…").frame(maxWidth: .infinity) }
+            else if let error = viewModel.recognitionError { Text(error).foregroundStyle(.secondary) }
+            else {
+                ScrollView { Text(displayText).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(minHeight: 90, maxHeight: 240)
             }
+            if !viewModel.recognitionIsBarcode {
+                Picker("Language:", selection: $language) {
+                    Text("Automatic").tag("auto"); Text("English").tag("en"); Text("Simplified Chinese").tag("zh-Hans")
+                }
+                Toggle("Strip linebreaks", isOn: $strip).toggleStyle(.checkbox)
+            }
+            HStack {
+                Button(viewModel.isRecognizing ? "Cancel" : "Recognize Again") {
+                    if viewModel.isRecognizing { viewModel.cancelRecognition() }
+                    else if viewModel.recognitionIsBarcode { viewModel.performQRDetection() }
+                    else { viewModel.performOCR() }
+                }
+                Spacer()
+                Button("Copy") {
+                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(displayText, forType: .string)
+                    viewModel.feedback = L10n.string("Copied")
+                }.disabled(viewModel.isRecognizing || viewModel.ocrText.isEmpty)
+            }
+            Text("Results stay on this Mac. Links are never opened automatically.").font(.caption).foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.bar)
+        .padding(18).frame(width: 420).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .padding(20)
     }
-
-    private func openBeautifier() {
-        let rendered = viewModel.renderFinalImage()
-        let hostingView = NSHostingView(rootView: LocalizedRoot { BackgroundBeautifierView(image: rendered) })
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 550),
-            styleMask: [.titled, .closable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.contentView = hostingView
-        window.title = L10n.string("Beautify Screenshot")
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-    }
+    private var displayText: String { strip ? viewModel.ocrText.replacingOccurrences(of: "\n", with: " ") : viewModel.ocrText }
 }
