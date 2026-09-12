@@ -17,6 +17,7 @@ enum EditorShortcutAction: String, CaseIterable, Codable {
     case ruler
     case colorPicker
     case ocr
+    case redact
 
     var tool: AnnotationTool {
         switch self {
@@ -35,6 +36,7 @@ enum EditorShortcutAction: String, CaseIterable, Codable {
         case .ruler: return .ruler
         case .colorPicker: return .colorPicker
         case .ocr: return .ocr
+        case .redact: return .redact
         }
     }
 
@@ -57,6 +59,7 @@ enum EditorShortcutAction: String, CaseIterable, Codable {
         case .ruler: return "U"
         case .colorPicker: return "I"
         case .ocr: return "E"
+        case .redact: return "D"
         }
     }
 }

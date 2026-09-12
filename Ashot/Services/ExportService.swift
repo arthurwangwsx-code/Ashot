@@ -33,6 +33,16 @@ enum ExportFailure: LocalizedError {
 }
 
 enum AtomicFileWriter {
+    nonisolated static func replace(_ data: Data, at destination: URL) throws {
+        let temporary = destination.deletingLastPathComponent().appendingPathComponent(".ashot-index-\(UUID().uuidString).tmp")
+        try data.write(to: temporary, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        guard chmod(temporary.path, S_IRUSR | S_IWUSR) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let result = temporary.withUnsafeFileSystemRepresentation { source in
+            destination.withUnsafeFileSystemRepresentation { target in rename(source, target) }
+        }
+        if result != 0 { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    }
     nonisolated static func writeExclusive(_ data: Data, to destination: URL) throws {
         let temporary = destination.deletingLastPathComponent().appendingPathComponent(".ashot-\(UUID().uuidString).tmp")
         try data.write(to: temporary, options: .atomic)

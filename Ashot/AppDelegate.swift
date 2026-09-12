@@ -102,10 +102,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let bindings = HotKeyManager.shared.bindings
 
         addMenuItem(to: menu, title: L10n.string("Capture Area"), action: #selector(captureArea), shortcut: bindings[.captureArea]?.displayString ?? "")
-        addMenuItem(to: menu, title: L10n.string("Sensitive Capture"), action: #selector(captureSensitive), shortcut: "")
+        addMenuItem(to: menu, title: L10n.string("Sensitive Capture"), action: #selector(captureSensitive), shortcut: bindings[.sensitiveCapture]?.displayString ?? "")
         addMenuItem(to: menu, title: L10n.string("Capture Fullscreen"), action: #selector(captureFullscreen), shortcut: bindings[.captureFullscreen]?.displayString ?? "")
         addMenuItem(to: menu, title: L10n.string("Capture Window"), action: #selector(captureWindow), shortcut: bindings[.captureWindow]?.displayString ?? "")
-        addMenuItem(to: menu, title: L10n.string("Capture with Delay (3s)"), action: #selector(captureDelayed), shortcut: bindings[.captureDelayed]?.displayString ?? "")
+        addMenuItem(to: menu, title: L10n.string("Capture with Delay"), action: #selector(captureDelayed), shortcut: bindings[.captureDelayed]?.displayString ?? "")
         addMenuItem(to: menu, title: L10n.string("Scrolling Capture"), action: #selector(captureScrolling), shortcut: bindings[.captureScrolling]?.displayString ?? "")
         menu.addItem(NSMenuItem.separator())
         addMenuItem(to: menu, title: L10n.string("Repeat Last Capture"), action: #selector(repeatLastCapture), shortcut: bindings[.repeatLast]?.displayString ?? "")
@@ -125,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recent.submenu = recentMenu; menu.addItem(recent)
         addMenuItem(to: menu, title: L10n.string("Open Image..."), action: #selector(openImage), shortcut: "")
         addMenuItem(to: menu, title: L10n.string("Edit Clipboard Image"), action: #selector(editClipboardImage), shortcut: "")
+        addMenuItem(to: menu, title: L10n.string("Close All Pinned Images"), action: #selector(closeAllPins), shortcut: "")
         menu.addItem(NSMenuItem.separator())
         let settingsItem = NSMenuItem(
             title: L10n.string("Settings..."),
@@ -215,8 +216,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func captureDelayed() {
-        CaptureService.shared.captureWithDelay(seconds: 3)
+        CaptureService.shared.captureWithDelay(seconds: UserDefaults.standard.object(forKey: "captureDelay") as? Int ?? 3)
     }
+    @objc private func closeAllPins() { PinService.shared.closeAll() }
 
     @objc private func captureScrolling() {
         ScrollingCaptureService.shared.startScrollingCapture()
@@ -235,20 +237,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openHistory() {
-        if let window = historyWindow, window.isVisible {
+        if let window = historyWindow {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
         let hostingView = NSHostingView(rootView: LocalizedRoot { HistoryView() })
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 450),
+            contentRect: NSRect(x: 0, y: 0, width: 960, height: 640),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.contentView = hostingView
         window.title = L10n.string("Screenshot History")
+        window.minSize = NSSize(width: 800, height: 560)
+        window.isReleasedWhenClosed = false
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -266,13 +270,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hostingView.autoresizingMask = [.width, .height]
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 460),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 880, height: 690),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.contentView = hostingView
         window.title = L10n.string("Ashot Settings")
+        window.minSize = NSSize(width: 800, height: 620)
         window.isReleasedWhenClosed = false
         window.center()
 

@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Observation
 
 extension Notification.Name {
     static let ashotShortcutsChanged = Notification.Name("ashotShortcutsChanged")
@@ -20,6 +21,7 @@ struct ShortcutBinding: Codable, Equatable {
     static let defaultScrolling = ShortcutBinding(keyCode: UInt32(kVK_ANSI_9), modifiers: UInt32(cmdKey | shiftKey), displayString: "⌘⇧9")
     static let defaultRepeat = ShortcutBinding(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(cmdKey | shiftKey), displayString: "⌘⇧R")
     static let defaultColorPicker = ShortcutBinding(keyCode: UInt32(kVK_ANSI_C), modifiers: UInt32(cmdKey | shiftKey), displayString: "⌘⇧C")
+    static let defaultSensitive = ShortcutBinding(keyCode: UInt32(kVK_ANSI_2), modifiers: UInt32(cmdKey | shiftKey | optionKey), displayString: "⌥⇧⌘2")
 }
 
 enum ShortcutAction: String, CaseIterable, Codable {
@@ -30,6 +32,7 @@ enum ShortcutAction: String, CaseIterable, Codable {
     case captureScrolling = "captureScrolling"
     case repeatLast = "repeatLast"
     case colorPicker = "colorPicker"
+    case sensitiveCapture = "sensitiveCapture"
 
     var displayName: String {
         switch self {
@@ -40,6 +43,7 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .captureScrolling: return L10n.string("Scrolling Capture")
         case .repeatLast: return L10n.string("Repeat Last Capture")
         case .colorPicker: return L10n.string("Color Picker")
+        case .sensitiveCapture: return L10n.string("Sensitive Capture")
         }
     }
 
@@ -52,10 +56,12 @@ enum ShortcutAction: String, CaseIterable, Codable {
         case .captureScrolling: return .defaultScrolling
         case .repeatLast: return .defaultRepeat
         case .colorPicker: return .defaultColorPicker
+        case .sensitiveCapture: return .defaultSensitive
         }
     }
 }
 
+@Observable
 final class HotKeyManager {
     static let shared = HotKeyManager()
     private static let bindingsKey = "shortcutBindings"
@@ -66,6 +72,7 @@ final class HotKeyManager {
 
     private(set) var bindings: [ShortcutAction: ShortcutBinding]
     private(set) var disabledActions: Set<ShortcutAction>
+    private(set) var registrationFailures: [ShortcutAction: Int32] = [:]
 
     private init() {
         let disabledRawValues = Set(UserDefaults.standard.stringArray(forKey: Self.disabledActionsKey) ?? [])
@@ -84,8 +91,19 @@ final class HotKeyManager {
         disabledRawValues: Set<String>
     ) -> [ShortcutAction: ShortcutBinding] {
         var result: [ShortcutAction: ShortcutBinding] = [:]
+        var used: Set<String> = []
+        // Explicit user bindings win over newly introduced default shortcuts during upgrades.
         for action in ShortcutAction.allCases where !disabledRawValues.contains(action.rawValue) {
-            result[action] = saved[action.rawValue] ?? action.defaultBinding
+            guard let saved = saved[action.rawValue], isUsableBinding(saved), !isReservedSystemScreenshotShortcut(saved) else { continue }
+            let key = "\(saved.modifiers):\(saved.keyCode)"
+            guard used.insert(key).inserted else { continue }
+            result[action] = saved
+        }
+        for action in ShortcutAction.allCases where !disabledRawValues.contains(action.rawValue) {
+            guard result[action] == nil else { continue }
+            let binding = action.defaultBinding
+            guard used.insert("\(binding.modifiers):\(binding.keyCode)").inserted else { continue }
+            result[action] = binding
         }
         return result
     }
@@ -106,6 +124,7 @@ final class HotKeyManager {
 
     func registerAll() {
         unregisterAll()
+        registrationFailures.removeAll()
         installHandlerIfNeeded()
 
         for (index, action) in ShortcutAction.allCases.enumerated() {
@@ -114,6 +133,7 @@ final class HotKeyManager {
             var hotKeyRef: EventHotKeyRef?
             let status = RegisterEventHotKey(binding.keyCode, binding.modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
             if status != noErr {
+                registrationFailures[action] = status
                 NSLog("Ashot: failed to register hotkey \(binding.displayString) for \(action.displayName) (status \(status)) — it may be in use by another app or the system.")
             }
             hotKeyRefs.append(hotKeyRef)
@@ -177,6 +197,7 @@ final class HotKeyManager {
     }
 
     func validationMessage(for action: ShortcutAction, binding: ShortcutBinding) -> String? {
+        if !Self.isUsableBinding(binding) { return L10n.string("Use Command, Control, or Option with a key.") }
         if Self.isReservedSystemScreenshotShortcut(binding) {
             return L10n.string("That shortcut is reserved by macOS. Choose another combination.")
         }
@@ -192,7 +213,7 @@ final class HotKeyManager {
 
     static func isReservedSystemScreenshotShortcut(_ binding: ShortcutBinding) -> Bool {
         let screenshotModifiers = UInt32(cmdKey | shiftKey)
-        guard binding.modifiers == screenshotModifiers else { return false }
+        guard binding.modifiers == screenshotModifiers || binding.modifiers == screenshotModifiers | UInt32(controlKey) else { return false }
         let reservedKeys: Set<UInt32> = [
             UInt32(kVK_ANSI_3), UInt32(kVK_ANSI_4),
             UInt32(kVK_ANSI_5), UInt32(kVK_ANSI_6)
@@ -205,10 +226,11 @@ final class HotKeyManager {
         case .captureArea: CaptureService.shared.startAreaCapture()
         case .captureFullscreen: CaptureService.shared.captureFullscreen()
         case .captureWindow: CaptureService.shared.captureWindow()
-        case .captureDelayed: CaptureService.shared.captureWithDelay(seconds: 3)
+        case .captureDelayed: CaptureService.shared.captureWithDelay(seconds: UserDefaults.standard.object(forKey: "captureDelay") as? Int ?? 3)
         case .captureScrolling: ScrollingCaptureService.shared.startScrollingCapture()
         case .repeatLast: CaptureService.shared.repeatLastCapture()
         case .colorPicker: ColorPickerService.shared.start()
+        case .sensitiveCapture: CaptureService.shared.startAreaCapture(sensitive: true)
         }
     }
 
@@ -264,12 +286,16 @@ final class HotKeyManager {
     static func binding(from event: NSEvent) -> ShortcutBinding? {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let modifiers = carbonModifiers(from: flags)
-        guard modifiers != 0 else { return nil }
+        guard modifiers & UInt32(cmdKey | controlKey | optionKey) != 0 else { return nil }
 
         let keyCode = UInt32(event.keyCode)
         let key = keyString(from: keyCode)
         guard key != "?" else { return nil }
         let display = modifierString(from: modifiers) + key
         return ShortcutBinding(keyCode: keyCode, modifiers: modifiers, displayString: display)
+    }
+    static func isUsableBinding(_ binding: ShortcutBinding) -> Bool {
+        let allowed = UInt32(cmdKey | controlKey | optionKey | shiftKey)
+        return binding.modifiers & ~allowed == 0 && binding.modifiers & UInt32(cmdKey | controlKey | optionKey) != 0 && keyString(from: binding.keyCode) != "?"
     }
 }

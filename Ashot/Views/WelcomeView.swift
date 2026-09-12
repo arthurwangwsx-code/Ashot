@@ -95,6 +95,7 @@ struct WelcomeView: View {
                         Toggle("Automatically copy to clipboard", isOn: $autoCopy)
                         Toggle("Open the editor immediately", isOn: $directEdit)
                         Toggle("Keep local screenshot history", isOn: $history)
+                            .onChange(of: history) { HistoryManager.shared.setEnabled(history) }
                         Text("With history off, recent images stay in memory for this session only. Existing history is not deleted. Sensitive capture never copies or saves the original automatically.")
                             .font(.caption).foregroundStyle(.secondary)
                     }.padding(6)

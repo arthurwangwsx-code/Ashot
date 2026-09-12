@@ -120,7 +120,7 @@ final class CaptureService {
         case .sensitiveArea: startAreaCapture(sensitive: true)
         case .fullscreen: captureFullscreen()
         case .window: captureWindow()
-        case .delayed: captureWithDelay(seconds: 3)
+        case .delayed: captureWithDelay(seconds: UserDefaults.standard.object(forKey: "captureDelay") as? Int ?? 3)
         case .scrolling: ScrollingCaptureService.shared.startScrollingCapture()
         case .colorPicker: ColorPickerService.shared.start()
         }

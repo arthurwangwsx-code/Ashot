@@ -5,6 +5,17 @@ enum ProductPreferences {
     /// Run before showing settings. Existing installations retain persistent history; new
     /// installations start session-only. This never deletes or migrates an existing library.
     static func bootstrap(defaults: UserDefaults = .standard, hasExistingHistory: Bool? = nil) {
+        initializeConsent(defaults: defaults, hasExistingHistory: hasExistingHistory)
+        guard defaults.integer(forKey: "productPreferencesVersion") < 2 else { return }
+        let legacy = defaults.bool(forKey: "existingUserMigration")
+        let values: [String: Any] = ["historyMaximumCount": 200, "historyMaximumDays": legacy ? 0 : 30,
+            "historyMaximumMB": legacy ? 0 : 1024, "previewTimeout": 10.0, "captureDelay": 3,
+            "jpegQuality": 0.9, "exportScale": "native", "scrollingMode": "manual", "scrollingInterval": 0.65,
+            "restoreDraftsEnabled": false]
+        for (key, value) in values where defaults.object(forKey: key) == nil { defaults.set(value, forKey: key) }
+        defaults.set(2, forKey: "productPreferencesVersion")
+    }
+    private static func initializeConsent(defaults: UserDefaults, hasExistingHistory: Bool?) {
         guard defaults.integer(forKey: "productPreferencesVersion") < 1 else { return }
         let oldKeys = ["saveLocation", "showPreview", "autoCopy", "historyFolder", "shortcutBindings", "appLanguage"]
         let legacyPreferences = oldKeys.contains { defaults.object(forKey: $0) != nil }
